@@ -1,0 +1,423 @@
+import sensor, time, math, ustruct
+from pyb import UART, USB_VCP
+
+# ==================================================
+# CONFIG - 常改的放這裡
+# ==================================================
+usb = USB_VCP()
+DEBUG = usb.isconnected()
+SEND_UART = True
+
+CENTER_X = 132
+CENTER_Y = 120
+FRONT_X = 127
+FRONT_Y = 121
+ROI = [20, 3, 255, 239]
+# ROI = [56, 3, 257, 239]
+
+BEAK_W = 10
+BEAK_H = 10
+
+BALL_IN_DISTANCE_CM = 10
+
+# ==================================================
+# MANUAL SENSOR SETTINGS
+# ==================================================
+MANUAL_EXPOSURE_US = 19000
+MANUAL_RGB_GAIN_DB = (69.0, 66.0, 69.0)
+MANUAL_GAIN_DB = 23.0
+
+MIN_EXPOSURE = 3000
+MAX_EXPOSURE = 30000
+
+MIN_RGB_GAIN = 0.0
+MAX_RGB_GAIN = 127.0
+
+MIN_GAIN_DB = 8.0
+MAX_GAIN_DB = 28.0
+
+# ==================================================
+# OBJECT CONFIG
+# ==================================================
+ITEM_BALL = 0
+ITEM_YELLOW = 1
+ITEM_BLUE = 2
+
+ITEMS = (
+    ("ball",   0x11, (13, 98, 22, 70, 9, 104),   (255, 0, 0)),
+    ("yellow", 0x12, (50, 80, -5, 25, 20, 65),     (255, 255, 0)),
+    ("blue",   0x13, (0, 100, -15, 15, -52, -20),    (0, 0, 255)),
+)
+
+# Protection is derived from ITEMS. If one blob matches more than one color,
+# keep the color whose LAB mean is closest to that color's threshold center.
+COLOR_SCORE_MARGIN = 0.10
+BLUE_BLACK_L_RANGE_FRACTION = 0.10
+
+# ==================================================
+# BALL FALLBACK
+# ==================================================
+FALLBACK_LAST_SEEN_ANGLE = 20
+FALLBACK_LAST_SEEN_DISTANCE_CM = 20
+FALLBACK_BALL_ANGLE = 0
+FALLBACK_BALL_DISTANCE = 8
+
+# ==================================================
+# GLOBAL STATE
+# ==================================================
+BEAK_X = FRONT_X - (BEAK_W // 2)
+BEAK_Y = FRONT_Y - (BEAK_H // 2)
+BEAK_RECT = (BEAK_X, BEAK_Y, BEAK_W, BEAK_H)
+
+thresholds = [item[2] for item in ITEMS]
+
+sensor_exposure = MANUAL_EXPOSURE_US
+sensor_rgb_gain = MANUAL_RGB_GAIN_DB
+sensor_gain_db = MANUAL_GAIN_DB
+
+uart = UART(3, 115200, timeout_char=1000)
+
+# ==================================================
+# MAIN - 平常常改 sensor.set... 可以在這裡改
+# ==================================================
+def main():
+    sensor.reset()
+    sensor.set_pixformat(sensor.RGB565)
+    sensor.set_framesize(sensor.QVGA)
+    sensor.set_windowing(ROI)
+    sensor.set_hmirror(True)
+
+    clock = time.clock()
+
+    sanitize_manual_settings()
+    apply_sensor_settings()
+    sanitize_thresholds()
+
+    last_ball_angle = None
+    last_ball_distance = None
+
+    while True:
+        if DEBUG:
+            clock.tick()
+
+        img = sensor.snapshot()
+
+        if DEBUG:
+            draw_debug_reference(img)
+
+        bv, ba, bd, ball_blob = find_object(img, ITEM_BALL, 2, 1, 10)
+        yv, ya, yd, yellow_blob = find_object(img, ITEM_YELLOW, 100, 100, 20)
+        blv, bla, bld, blue_blob = find_object(img, ITEM_BLUE, 100, 100, 20)
+
+        ball_in = False
+
+        if bv:
+            ball_in = bd < BALL_IN_DISTANCE_CM and abs(ba) < 10
+            last_ball_angle = ba
+            last_ball_distance = bd
+
+            if DEBUG and ball_blob:
+                draw_blob(img, ball_blob, ITEM_BALL)
+
+        elif should_use_ball_fallback(last_ball_angle, last_ball_distance):
+            bv = True
+            ba = FALLBACK_BALL_ANGLE
+            bd = FALLBACK_BALL_DISTANCE
+            ball_in = True
+
+        if DEBUG:
+            if yellow_blob:
+                draw_blob(img, yellow_blob, ITEM_YELLOW)
+            if blue_blob:
+                draw_blob(img, blue_blob, ITEM_BLUE)
+
+        if SEND_UART:
+            if DEBUG:
+                print(
+                    int(ba), int(bd),
+                    int(ya), int(yd),
+                    int(bla), int(bld),
+                    1 if ball_in else 0
+                )
+
+            send_objects_packet(
+                (bv, ba, bd),
+                (yv, ya, yd),
+                (blv, bla, bld),
+                ball_in
+            )
+
+# ==================================================
+# DETECTION
+# ==================================================
+def find_object(img, idx, pixels_threshold, area_threshold, margin):
+    blobs = img.find_blobs(
+        [thresholds[idx]],
+        pixels_threshold=pixels_threshold,
+        area_threshold=area_threshold,
+        merge=True,
+        margin=margin
+    )
+
+    if not blobs:
+        return False, 0, 255, None
+
+    if idx == ITEM_BALL:
+        blobs = [b for b in blobs if orange_candidate_ok(img, b)]
+        if not blobs:
+            return False, 0, 255, None
+
+    elif idx == ITEM_YELLOW:
+        blobs = [b for b in blobs if yellow_candidate_ok(img, b)]
+        if not blobs:
+            return False, 0, 255, None
+
+    elif idx == ITEM_BLUE:
+        blobs = [b for b in blobs if blue_candidate_ok(img, b)]
+        if not blobs:
+            return False, 0, 255, None
+
+    blob, angle, pixel_dist = blob_output(blobs)
+    distance = pixel_to_distance_cm(pixel_dist)
+
+    return True, angle, distance, blob
+
+def pixel_to_distance_cm(pixel_dist):
+    return 0.02273 * (pixel_dist ** 2) - 2.273 * pixel_dist + 63.704
+
+def best_blob(blobs):
+    best = None
+    best_score = -1
+
+    for blob in blobs:
+        score = blob.pixels()
+
+        if is_in_beak(blob):
+            score += 100000
+
+        if score > best_score:
+            best_score = score
+            best = blob
+
+    return best
+
+def blob_output(blobs):
+    blob = best_blob(blobs)
+    angle, pixel_dist = angle_and_pixel_dist(blob.cx(), blob.cy())
+    return blob, angle, pixel_dist
+
+def angle_and_pixel_dist(x, y):
+    dx = x - CENTER_X
+    dy = -(y - CENTER_Y)
+
+    angle = math.degrees(math.atan2(dx, dy))
+    pixel_dist = math.sqrt(dx * dx + dy * dy)
+
+    return angle, pixel_dist
+
+def is_in_beak(blob):
+    return (
+        BEAK_X <= blob.cx() <= BEAK_X + BEAK_W and
+        BEAK_Y <= blob.cy() <= BEAK_Y + BEAK_H
+    )
+
+def should_use_ball_fallback(last_angle, last_distance):
+    return (
+        last_angle is not None and
+        last_distance is not None and
+        abs(last_angle) < FALLBACK_LAST_SEEN_ANGLE and
+        last_distance < FALLBACK_LAST_SEEN_DISTANCE_CM
+    )
+
+# ==================================================
+# MANUAL COLOR PROTECTION
+# ==================================================
+def protect_manual_thresholds():
+    thresholds[ITEM_BALL] = clamp_threshold(thresholds[ITEM_BALL])
+    thresholds[ITEM_YELLOW] = clamp_threshold(thresholds[ITEM_YELLOW])
+    thresholds[ITEM_BLUE] = clamp_threshold(thresholds[ITEM_BLUE])
+
+def clamp_threshold(th):
+    return (
+        int(clamp(th[0], 0, 100)),
+        int(clamp(th[1], 0, 100)),
+        int(clamp(th[2], -128, 127)),
+        int(clamp(th[3], -128, 127)),
+        int(clamp(th[4], -128, 127)),
+        int(clamp(th[5], -128, 127)),
+    )
+
+def stats_roi(img, blob, idx):
+    if idx == ITEM_BALL:
+        w = max(3, (blob.w() * 2) // 3)
+        h = max(3, (blob.h() * 2) // 3)
+        x = max(0, blob.cx() - w // 2)
+        y = max(0, blob.cy() - h // 2)
+    else:
+        w = max(4, blob.w() // 8)
+        h = max(4, blob.h() // 8)
+        x = max(0, blob.cx() - w // 2)
+        y = max(0, blob.cy() - h )
+
+    if x + w > img.width():
+        w = img.width() - x
+    if y + h > img.height():
+        h = img.height() - y
+
+    return (x, y, w, h)
+
+def orange_candidate_ok(img, blob):
+    stats = blob_lab_mean(img, blob, ITEM_BALL)
+    return protected_color_ok(stats, ITEM_BALL)
+
+def yellow_candidate_ok(img, blob):
+    stats = blob_lab_mean(img, blob, ITEM_YELLOW)
+    return protected_color_ok(stats, ITEM_YELLOW)
+
+def blue_candidate_ok(img, blob):
+    stats = blob_lab_mean(img, blob, ITEM_BLUE)
+    return protected_color_ok(stats, ITEM_BLUE) and blue_not_black(stats)
+
+def blob_lab_mean(img, blob, idx):
+    stats = img.get_statistics(roi=stats_roi(img, blob, idx))
+    return (stats.l_mean(), stats.a_mean(), stats.b_mean())
+
+def protected_color_ok(lab, idx):
+    own_score = threshold_score(lab, thresholds[idx])
+
+    for other_idx in range(len(thresholds)):
+        if other_idx == idx:
+            continue
+
+        if not lab_in_threshold(lab, thresholds[other_idx]):
+            continue
+
+        other_score = threshold_score(lab, thresholds[other_idx])
+
+        if other_score + COLOR_SCORE_MARGIN < own_score:
+            return False
+
+    return True
+
+def blue_not_black(lab):
+    blue = thresholds[ITEM_BLUE]
+    min_l = blue[0] + ((blue[1] - blue[0]) * BLUE_BLACK_L_RANGE_FRACTION)
+
+    return lab[0] >= min_l
+
+def lab_in_threshold(lab, th):
+    return (
+        th[0] <= lab[0] <= th[1] and
+        th[2] <= lab[1] <= th[3] and
+        th[4] <= lab[2] <= th[5]
+    )
+
+def threshold_score(lab, th):
+    l_mid = (th[0] + th[1]) / 2
+    a_mid = (th[2] + th[3]) / 2
+    b_mid = (th[4] + th[5]) / 2
+
+    l_half = max((th[1] - th[0]) / 2, 1)
+    a_half = max((th[3] - th[2]) / 2, 1)
+    b_half = max((th[5] - th[4]) / 2, 1)
+
+    dl = (lab[0] - l_mid) / l_half
+    da = (lab[1] - a_mid) / a_half
+    db = (lab[2] - b_mid) / b_half
+
+    return (dl * dl) + (da * da) + (db * db)
+
+def apply_sensor_settings(settle=True):
+    sensor.set_auto_exposure(False, exposure_us=int(sensor_exposure))
+    sensor.set_auto_whitebal(False, rgb_gain_db=sensor_rgb_gain)
+    sensor.set_auto_gain(False, gain_db=sensor_gain_db)
+
+    if settle:
+        sensor.skip_frames(time=1000)
+
+def sanitize_manual_settings():
+    global sensor_exposure, sensor_rgb_gain, sensor_gain_db
+
+    sensor_exposure = int(clamp(
+        MANUAL_EXPOSURE_US,
+        MIN_EXPOSURE,
+        MAX_EXPOSURE
+    ))
+
+    sensor_rgb_gain = (
+        clamp(MANUAL_RGB_GAIN_DB[0], MIN_RGB_GAIN, MAX_RGB_GAIN),
+        clamp(MANUAL_RGB_GAIN_DB[1], MIN_RGB_GAIN, MAX_RGB_GAIN),
+        clamp(MANUAL_RGB_GAIN_DB[2], MIN_RGB_GAIN, MAX_RGB_GAIN),
+    )
+
+    sensor_gain_db = clamp(
+        MANUAL_GAIN_DB,
+        MIN_GAIN_DB,
+        MAX_GAIN_DB
+    )
+
+def sanitize_thresholds():
+    protect_manual_thresholds()
+
+# ==================================================
+# UART
+# ==================================================
+def send_objects_packet(ball, yellow, blue, ball_in=False):
+    b_flags = 2 if ball_in else 0
+
+    bf, bs, bm, bd = object_fields(ball[0], ball[1], ball[2], b_flags)
+    yf, ys, ym, yd = object_fields(yellow[0], yellow[1], yellow[2])
+    blf, bls, blm, bld = object_fields(blue[0], blue[1], blue[2])
+
+    pkt = ustruct.pack(
+        "<BBBBBBBBBBBBBB",
+        0xA5,
+        bf, bs, bm, bd,
+        yf, ys, ym, yd,
+        blf, bls, blm, bld,
+        0x55
+    )
+
+    uart.write(pkt)
+
+def object_fields(valid, angle, distance, flags=0):
+    sign, mag = signed_mag(angle)
+
+    return (
+        (1 if valid else 0) | flags,
+        sign,
+        clamp(mag, 0, 255),
+        clamp(int(distance), 0, 255)
+    )
+
+# ==================================================
+# DEBUG DRAW
+# ==================================================
+def draw_debug_reference(img):
+    img.draw_rectangle(BEAK_RECT, color=(255, 0, 0))
+    img.draw_cross(FRONT_X, FRONT_Y, color=(255, 0, 0), size=2)
+    img.draw_cross(CENTER_X, CENTER_Y, color=(255, 255, 255), size=2)
+
+def draw_blob(img, blob, idx):
+    color = ITEMS[idx][3]
+    img.draw_rectangle(blob.rect(), color=color)
+    img.draw_cross(blob.cx(), blob.cy(), color=color, size=2)
+
+# ==================================================
+# SMALL HELPERS
+# ==================================================
+def clamp(v, lo, hi):
+    return min(max(v, lo), hi)
+
+def signed_mag(angle):
+    rel = int(angle)
+
+    if rel > 180:
+        rel -= 360
+
+    return (1 if rel >= 0 else 0), abs(rel)
+
+# ==================================================
+# START
+# ==================================================
+main()

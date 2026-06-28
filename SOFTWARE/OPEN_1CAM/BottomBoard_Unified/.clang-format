@@ -1,0 +1,13 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+# 核心設定：讓大括號在所有地方都換行 (Allman style)
+BreakBeforeBraces: Stroustrup
+# 確保關鍵字如 else, catch 等都在新的一行
+AllowShortBlocksOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+# 縮排設定
+IndentWidth: 4
+ColumnLimit: 120
+---
